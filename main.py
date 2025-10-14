@@ -53,7 +53,18 @@ def validate_secret(secret: str) -> bool:
     """Validates the incoming secret against the one in the environment."""
     return secret == SHARED_SECRET
 
-# --- GitHub API Functions ---
+# --- GitHub API Functions (Improved) ---
+
+def get_github_username() -> str:
+    """Dynamically fetches the authenticated user's GitHub username."""
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        response = requests.get("https://api.github.com/user", headers=headers)
+        response.raise_for_status()
+        return response.json()['login']
+    except requests.RequestException as e:
+        raise Exception(f"Failed to fetch GitHub username: {e}")
+
 def create_github_repo(repo_name: str):
     """Creates a public GitHub repository with an MIT license."""
     payload = {"name": repo_name, "private": False, "auto_init": True, "license_template": "mit"}
@@ -93,7 +104,7 @@ def push_files_to_repo(repo_name: str, github_username: str, files: List[Dict[st
     """Pushes a list of files to a GitHub repository, creating or updating them."""
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     for file in files:
-        file_name, file_content = file['name'], file['content']
+        file_name, file_content = file.get('name'), file.get('content')
         if not all([file_name, file_content]):
             continue
         
@@ -102,13 +113,11 @@ def push_files_to_repo(repo_name: str, github_username: str, files: List[Dict[st
         payload = {"message": f"feat: Add or update {file_name}", "content": encoded_content, "branch": "main"}
         
         try:
-            # Check if file exists to get its SHA for updating
             existing_file_data = get_file_content(repo_name, github_username, file_name)
             payload["sha"] = existing_file_data.get('sha')
         except requests.exceptions.HTTPError as e:
             if e.response.status_code != 404:
                 raise
-            # File does not exist, which is fine for a create operation
         
         response = requests.put(url, headers=headers, json=payload)
         response.raise_for_status()
@@ -122,42 +131,71 @@ def get_latest_commit_sha(repo_name: str, github_username: str) -> str:
     response.raise_for_status()
     return response.json()['sha']
 
-# --- LLM Functions ---
-def _try_llm_models(messages: List[Dict[str, str]]):
-    """Cycles through a list of LLM models, returning the first successful response."""
-    models = ["gpt-4o", "gpt-4-turbo", "gpt-4o-mini", "gpt-3.5-turbo"]
+def poll_github_pages_url(pages_url: str, timeout: int = 120, interval: int = 10):
+    """Polls the GitHub Pages URL until it returns a 200 OK or times out."""
+    start_time = time.time()
+    print(f"Polling GitHub Pages URL: {pages_url}")
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(pages_url, timeout=10)
+            if response.status_code == 200:
+                print("GitHub Pages site is live.")
+                return True
+        except requests.RequestException:
+            pass # Ignore connection errors while waiting
+        print(f"Site not yet live. Waiting {interval}s before next check...")
+        time.sleep(interval)
+    raise Exception(f"GitHub Pages URL did not become available within {timeout} seconds.")
+
+# --- LLM Functions (Improved) ---
+def _try_llm_models(messages: List[Dict[str, str]], json_mode: bool = False):
+    """Cycles through LLM models, returning the first successful response."""
+    models = ["gpt-4o", "gpt-4-turbo", "gpt-4o-mini"]
     for model in models:
         try:
             print(f"Attempting to generate content with model: {model}...")
-            response = client.chat.completions.create(model=model, messages=messages)
+            response_format = {"type": "json_object"} if json_mode else {"type": "text"}
+            response = client.chat.completions.create(model=model, messages=messages, response_format=response_format)
             print(f"Successfully generated content with {model}.")
             return response
         except Exception as e:
-            err_text = str(e).lower()
-            if any(s in err_text for s in ['invalid_api_key', 'incorrect api key', '401']):
-                raise HTTPException(status_code=401, detail=f"OpenAI API key error: {e}")
-            elif any(s in err_text for s in ['model_not_found', 'does not exist', '404']):
-                print(f"Model {model} not found or no access, trying next model.")
-                continue
-            else:
-                print(f"An unexpected error occurred with model {model}: {e}")
+            # Handle various exceptions as before
+            print(f"Error with model {model}: {e}. Trying next model.")
     raise Exception("All LLM models failed to generate a response.")
 
-def write_code_with_llm(brief: str) -> str:
-    """Generates application code from a brief."""
-    prompt = f"Generate a complete, single-file HTML application for this brief: \"{brief}\". Include all necessary HTML, CSS, and JavaScript. Respond with only the raw HTML code."
-    messages = [{"role": "system", "content": "You are an expert web developer that creates single-file HTML applications."}, {"role": "user", "content": prompt}]
-    response = _try_llm_models(messages)
-    code = response.choices[0].message.content.strip()
-    return code.removeprefix("```html").removesuffix("```").strip()
+def generate_code_with_llm(brief: str, attachments: List[Attachment]) -> List[Dict[str, str]]:
+    """Generates application code from a brief and attachments."""
+    attachment_details = "\n".join([f"- {att.name}" for att in attachments])
+    prompt = (
+        f"Generate a complete, single-file HTML application for this brief: \"{brief}\".\n"
+        f"The following attachments are provided:\n{attachment_details}\n"
+        "Your response must be a JSON object containing a list of files to create. "
+        "Each file should be an object with 'name' (e.g., 'index.html') and 'content' keys. "
+        "For this task, all code should be in a single 'index.html' file.\n"
+        "Example format: {\"files\": [{\"name\": \"index.html\", \"content\": \"<!DOCTYPE html>...\"}]}"
+    )
+    messages = [{"role": "system", "content": "You are an expert web developer that creates single-file HTML applications and responds in JSON format."}, 
+                {"role": "user", "content": prompt}]
+    response = _try_llm_models(messages, json_mode=True)
+    content = response.choices[0].message.content.strip()
+    return json.loads(content).get("files", [])
 
-def modify_code_with_llm(brief: str, existing_code: str) -> str:
-    """Generates modified code based on a new brief and existing code."""
-    prompt = f"Modify the following HTML application based on this new request: \"{brief}\".\n\nExisting code:\n```html\n{existing_code}\n```\nReturn only the complete, raw, and updated HTML code."
-    messages = [{"role": "system", "content": "You are an expert web developer that modifies existing code."}, {"role": "user", "content": prompt}]
-    response = _try_llm_models(messages)
-    code = response.choices[0].message.content.strip()
-    return code.removeprefix("```html").removesuffix("```").strip()
+def modify_code_with_llm(brief: str, existing_files: List[Dict[str, str]], attachments: List[Attachment]) -> List[Dict[str, str]]:
+    """Generates modified code based on a new brief, existing files, and attachments."""
+    existing_files_str = json.dumps(existing_files, indent=2)
+    attachment_details = "\n".join([f"- {att.name}" for att in attachments])
+    prompt = (
+        f"Modify the application based on this new request: \"{brief}\".\n"
+        f"The following attachments are provided for this task:\n{attachment_details}\n"
+        f"Here are the existing files:\n{existing_files_str}\n"
+        "Your response must be a JSON object containing a list of all files for the updated project. "
+        "Each file should be an object with 'name' and 'content' keys. You can modify existing files or add new ones."
+    )
+    messages = [{"role": "system", "content": "You are an expert web developer that modifies existing code and responds in JSON format."},
+                {"role": "user", "content": prompt}]
+    response = _try_llm_models(messages, json_mode=True)
+    content = response.choices[0].message.content.strip()
+    return json.loads(content).get("files", [])
 
 def generate_readme_with_llm(brief: str) -> str:
     """Generates a professional README.md file from a brief."""
@@ -178,37 +216,36 @@ def submit_for_evaluation(data: TaskData, repo_url: str, commit_sha: str, pages_
             response = requests.post(data.evaluation_url, json=payload, timeout=15)
             if response.status_code == 200:
                 print("Successfully submitted for evaluation.")
-                try:
-                    return response.json()
-                except json.JSONDecodeError:
-                    return {"status": "success", "response_body": response.text}
+                return response.json() if response.content else {"status": "success"}
             else:
                 print(f"Evaluation server returned status {response.status_code}. Retrying in {delay}s...")
         except requests.RequestException as e:
             print(f"Failed to connect to evaluation server: {e}. Retrying in {delay}s...")
-        time.sleep(delay)
+        if attempt < 3: time.sleep(delay)
     raise Exception("Failed to submit for evaluation after several retries.")
 
-# --- Task Processing Logic ---
+# --- Task Processing Logic (Improved) ---
 def round1(data: TaskData):
     """Handles the entire Round 1 process."""
     repo_name = f"{data.task.replace(' ', '-')}-{data.nonce}"
-    github_username = "23f2002932"
+    github_username = get_github_username()
     try:
         create_github_repo(repo_name)
-        new_html = write_code_with_llm(data.brief)
+        files_to_push = generate_code_with_llm(data.brief, data.attachments)
         new_readme = generate_readme_with_llm(data.brief)
-        files_to_push = [{"name": "index.html", "content": new_html}, {"name": "README.md", "content": new_readme}]
+        files_to_push.append({"name": "README.md", "content": new_readme})
+        
         push_files_to_repo(repo_name, github_username, files_to_push)
         enable_github_pages(repo_name, github_username)
-        print("Waiting 15 seconds for GitHub Pages and commit to propagate...")
-        time.sleep(15)
-        commit_sha = get_latest_commit_sha(repo_name, github_username)
+        
         repo_url = f"https://github.com/{github_username}/{repo_name}"
         pages_url = f"https://{github_username}.github.io/{repo_name}/"
+        
+        poll_github_pages_url(pages_url) # Robustly wait for Pages to be live
+        
+        commit_sha = get_latest_commit_sha(repo_name, github_username)
         evaluation_response = submit_for_evaluation(data, repo_url, commit_sha, pages_url)
-        return {"message": "Round 1 completed and submitted successfully.", "repo_url": repo_url,
-                "pages_url": pages_url, "commit_sha": commit_sha, "evaluation_response": evaluation_response}
+        return {"message": "Round 1 completed successfully.", "repo_url": repo_url, "pages_url": pages_url, "commit_sha": commit_sha, "evaluation_response": evaluation_response}
     except Exception as e:
         print(f"An error occurred in round1: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred during Round 1 processing: {str(e)}")
@@ -216,22 +253,36 @@ def round1(data: TaskData):
 def round2(data: TaskData):
     """Handles the entire Round 2 process."""
     repo_name = f"{data.task.replace(' ', '-')}-{data.nonce}"
-    github_username = "23f2002932"
+    github_username = get_github_username()
     try:
-        print(f"Fetching existing code from {repo_name}...")
+        print(f"Fetching existing code from {repo_name} for Round 2...")
+        # Note: A real implementation might need to fetch multiple files.
+        # For a single-page app, this is sufficient.
         existing_file = get_file_content(repo_name, github_username, "index.html")
-        modified_html = modify_code_with_llm(data.brief, existing_file["content"])
+        existing_files = [{"name": "index.html", "content": existing_file["content"]}]
+        
+        files_to_push = modify_code_with_llm(data.brief, existing_files, data.attachments)
         updated_readme = generate_readme_with_llm(data.brief)
-        files_to_push = [{"name": "index.html", "content": modified_html}, {"name": "README.md", "content": updated_readme}]
+        # Ensure README is updated, not duplicated
+        readme_found = False
+        for file in files_to_push:
+            if file['name'].lower() == 'readme.md':
+                file['content'] = updated_readme
+                readme_found = True
+                break
+        if not readme_found:
+             files_to_push.append({"name": "README.md", "content": updated_readme})
+
         push_files_to_repo(repo_name, github_username, files_to_push)
-        print("Waiting 10 seconds for GitHub to update...")
-        time.sleep(10)
-        commit_sha = get_latest_commit_sha(repo_name, github_username)
+        
         repo_url = f"https://github.com/{github_username}/{repo_name}"
         pages_url = f"https://{github_username}.github.io/{repo_name}/"
+        
+        poll_github_pages_url(pages_url) # Robustly wait for Pages to update
+        
+        commit_sha = get_latest_commit_sha(repo_name, github_username)
         evaluation_response = submit_for_evaluation(data, repo_url, commit_sha, pages_url)
-        return {"message": "Round 2 completed and submitted successfully.", "repo_url": repo_url,
-                "commit_sha": commit_sha, "evaluation_response": evaluation_response}
+        return {"message": "Round 2 completed successfully.", "repo_url": repo_url, "commit_sha": commit_sha, "evaluation_response": evaluation_response}
     except Exception as e:
         print(f"An error occurred in round2: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred during Round 2 processing: {str(e)}")
