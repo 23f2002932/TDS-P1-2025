@@ -3,6 +3,4 @@ uvicorn
 requests
 python-dotenv
 openai
-pydanti
 gunicorn
-
